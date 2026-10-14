@@ -303,6 +303,7 @@ def request_event(entry: dict, request_id: str, event_index: int) -> tuple[dict,
         "thread": entry["thread"],
         "eventType": event_type,
         "message": event_message,
+        "raw": entry["raw"],
         "truncated": truncated,
         "requestId": request_id if entry["request_id"] == request_id else None,
     }

@@ -53,7 +53,7 @@ class InvestigatorTests(unittest.TestCase):
         self.assertTrue({'request_id','environment','count','truncated_possible','start','end','errors','timeline'} <= response.keys())
         self.assertIn('raw',response['timeline'][0])
         self.assertNotIn('1234567890',response['timeline'][0]['raw'])
-        self.assertNotIn('raw',response['events'][0])
+        self.assertEqual(response['events'][0]['raw'],response['timeline'][0]['raw'])
         self.assertTrue(response['events'][0]['truncated'])
         self.assertLessEqual(len(response['events'][0]['message']),300)
 
