@@ -141,6 +141,24 @@ class InvestigatorTests(unittest.TestCase):
                   'inline-cookie', 'ABCDE1234F',
                           '1234 5678 9012', '9876543210', 'person@example.com'):
             self.assertNotIn(sensitive, result)
+    def test_analysis_item_normalization_only_removes_real_list_prefixes(self):
+        normalized = main.normalize_analysis_items([
+            '1. Check service mapping\n2) "Verify downstream status"',
+            '- Preserve -value exactly\n\u2022 Check request completion',
+            '3.14 release behavior\n"Quoted item"\n   ',
+        ])
+        self.assertEqual(normalized, [
+            'Check service mapping', 'Verify downstream status',
+            'Preserve -value exactly', 'Check request completion',
+            '3.14 release behavior', 'Quoted item',
+        ])
+    def test_analysis_prompt_sets_evidence_and_http_constraints(self):
+        instructions = ' '.join(main.ANALYSIS_SYSTEM_INSTRUCTIONS.split())
+        self.assertIn('An "not found" lookup does not prove a database record is missing', instructions)
+        self.assertIn('HTTP 200 does not prove every internal operation succeeded', instructions)
+        self.assertIn('An ERROR log alone does not prove the overall request failed', instructions)
+        self.assertIn('HIGH requires strong, direct evidence', instructions)
+        self.assertIn('Reference only supplied event indices', instructions)
     def test_analysis_rejects_conflicting_inputs_without_groq_call(self):
         with (
             patch.dict('os.environ', {'API_TOKEN': 'test-token'}),
