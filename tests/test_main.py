@@ -198,5 +198,31 @@ class InvestigatorTests(unittest.TestCase):
         groq.assert_awaited_once()
         self.assertEqual(first['evidence'][0]['eventIndex'], 2)
         main.ANALYSIS_CACHE.clear()
+    def test_prod_environment_is_used_by_all_log_apis(self):
+        self.assertEqual(main.selector_for_environment('prod'), '{env="prod",app="prod"}')
+        with patch('main.loki_query', new=AsyncMock(return_value=[])) as loki:
+            timeline = asyncio.run(main.request_timeline('pH8NUNKM', environment='prod'))
+        self.assertEqual(timeline['environment'], 'prod')
+        self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
+
+        with patch('main.loki_query', new=AsyncMock(return_value=[])) as loki:
+            activity = asyncio.run(main.user_activity('some-user', environment='prod'))
+        self.assertEqual(activity['environment'], 'prod')
+        self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
+
+        with patch('main.loki_query', new=AsyncMock(return_value=[])) as loki:
+            errors = asyncio.run(main.recent_errors(environment='prod'))
+        self.assertEqual(errors['environment'], 'prod')
+        self.assertIn('{env="prod",app="prod"}', loki.await_args.args[0])
+
+        with (
+            patch.dict('os.environ', {'API_TOKEN': 'test-token'}),
+            patch('main.request_timeline', new=AsyncMock(return_value={'count': 0})) as timeline,
+        ):
+            with self.assertRaises(main.HTTPException):
+                asyncio.run(main.analyze_request(
+                    main.AnalyzeRequest(requestId='pH8NUNKM'), environment='prod'
+                ))
+        self.assertEqual(timeline.await_args.kwargs['environment'], 'prod')
 
 if __name__=='__main__': unittest.main()

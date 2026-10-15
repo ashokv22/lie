@@ -54,6 +54,12 @@ Output:
 
 ANALYSIS_CACHE: dict[tuple[str, str], dict] = {}
 SELECTOR = '{env="uat",app="uat"}'
+
+
+def selector_for_environment(environment: Literal["uat", "prod"]) -> str:
+    return f'{{env="{environment}",app="{environment}"}}'
+
+
 HEADER = re.compile(
     r"^(?P<timestamp>\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}) "
     r"\[(?P<thread>[^]]+)\] (?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+"
@@ -504,6 +510,7 @@ async def call_groq(context: str, valid_indices: set[int], free_text: bool) -> d
 async def analyze_request(
     body: AnalyzeRequest,
     access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
 ):
     if body.request_id is not None and body.text is not None:
         raise HTTPException(status_code=400, detail="Provide either requestId or text, not both")
@@ -515,7 +522,10 @@ async def analyze_request(
     investigation = None
     request_id = body.request_id
     if request_id is not None:
-        investigation = await request_timeline(request_id, body.minutes, 1000, access_token=access_token)
+        investigation = await request_timeline(
+            request_id, body.minutes, 1000,
+            access_token=access_token, environment=environment,
+        )
         if not investigation.get("count"):
             raise HTTPException(status_code=404, detail=f"No logs found for requestId {request_id}")
     context, valid_indices = build_analysis_context(body.text, investigation)
@@ -529,17 +539,20 @@ async def analyze_request(
             ANALYSIS_CACHE.pop(next(iter(ANALYSIS_CACHE)))
         ANALYSIS_CACHE[cache_key] = result
     return result
+
 def redact_request_entry(entry: dict) -> dict:
     redacted = dict(entry)
     for field in ("raw", "message"):
         if isinstance(redacted.get(field), str):
             redacted[field] = redact_sensitive_text(redacted[field])
     return redacted
+
 def authorize_request_investigation(token: str | None) -> None:
     if REQUEST_INVESTIGATION_TOKEN and (
         not token or not hmac.compare_digest(token, REQUEST_INVESTIGATION_TOKEN)
     ):
         raise HTTPException(status_code=401, detail="Request investigation access denied")
+
 # Match an exception declaration at the beginning of a line, not a casual
 # mention of an exception in an ordinary INFO log.
 EXCEPTION_DECLARATION = re.compile(
@@ -547,6 +560,7 @@ EXCEPTION_DECLARATION = re.compile(
     r"(?P<class>[\w.$]+(?:Exception|Error))"
     r"(?::\s*(?P<message>[^\r\n]*))?\s*$"
 )
+
 ADVICE_EXCEPTION_DECLARATION = re.compile(
     r"(?m)^\s*GlobalExceptionHandlingControllerAdvice\b[^\r\n]*?"
     r"(?P<class>[\w.$]+(?:Exception|Error))\s*:\s*(?P<message>[^\r\n]*)"
@@ -571,15 +585,18 @@ def parse_entry(ns: str, raw: str) -> dict:
     declaration = find_exception_declaration(entry["message"])
     entry["exception"] = declaration.group("class") if declaration else None
     return entry
+
 def normalize_username(username: str) -> str:
     normalized = username.strip().casefold()
     if normalized.endswith(EMAIL_DOMAIN):
         normalized = normalized[:-len(EMAIL_DOMAIN)]
     return normalized
+
 def is_anonymous_username(username: str | None) -> bool:
     return not username or normalize_username(username) in {
         "anonymous", "anonymoususer", "anonymous_user", "anonymous-user", "unknown", "n/a"
     }
+
 def classify_error(entry: dict, request_url: str | None) -> str:
     logger = (entry.get("logger") or "").casefold()
     exception = (entry.get("exception") or "").casefold()
@@ -594,6 +611,7 @@ def classify_error(entry: dict, request_url: str | None) -> str:
         r"/(?:auth|login|logout|oauth|token|session|sso|signin|signout)(?:/|\?|$)", endpoint
     )
     return "authentication" if auth_logger or auth_exception or auth_endpoint else "application"
+
 def enrich_recent_errors(errors: list[dict], related_entries: list[dict], minutes: int) -> list[dict]:
     related_by_id = {}
     for entry in related_entries:
@@ -631,6 +649,7 @@ def enrich_recent_errors(errors: list[dict], related_entries: list[dict], minute
                      "requestUrl": request_url, "activityUrl": activity_url})
         enriched.append(item)
     return enriched
+
 def parse_request_fields(entry: dict, marker: str) -> dict | None:
     match = re.search(rf"\bREQ {marker}\s*\|(?P<fields>.*)", entry["message"])
     if not match:
@@ -660,12 +679,15 @@ def parse_request_fields(entry: dict, marker: str) -> dict | None:
         value = float(duration_match.group(1))
         result["durationMs"] = int(value) if value.is_integer() else value
     return result
+
 def _timestamp_key(timestamp: str) -> datetime:
     parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     if parsed.tzinfo:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
-def build_user_activity(entries: list[dict], username: str, limit: int) -> dict:
+    
+def build_user_activity(entries: list[dict], username: str, limit: int,
+                        environment: Literal["uat", "prod"] = "uat") -> dict:
     normalized_username = normalize_username(username)
     matching = [entry for entry in entries
                 if entry["user"] and normalize_username(entry["user"]) == normalized_username]
@@ -715,7 +737,7 @@ def build_user_activity(entries: list[dict], username: str, limit: int) -> dict:
                      )[:10]]
     return {
         "username": normalized_username,
-        "environment": "uat",
+        "environment": environment,
         "truncated_possible": len(entries) >= limit,
         "summary_is_exact": len(entries) < limit,
         "requests": requests,
@@ -727,6 +749,7 @@ def build_user_activity(entries: list[dict], username: str, limit: int) -> dict:
             "topEndpoints": top_endpoints,
         },
     }
+
 async def loki_query(query: str, minutes: int, limit: int, direction: str = "BACKWARD",
                      window_end: datetime | None = None) -> list[dict]:
     end = window_end or datetime.now(timezone.utc)
@@ -747,15 +770,17 @@ async def loki_query(query: str, minutes: int, limit: int, direction: str = "BAC
                for ns, line in stream.get("values", [])]
     entries.sort(key=lambda x: x["timestamp"])
     return entries
+
 @app.get("/health")
-async def health():
+async def health(environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat"):
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{LOKI_URL}/ready")
             response.raise_for_status()
-        return {"status": "ok", "loki": "ready", "environment": "uat"}
+        return {"status": "ok", "loki": "ready", "environment": environment}
     except httpx.HTTPError:
         raise HTTPException(status_code=503, detail="Loki unavailable; check SSH tunnel")
+
 def request_event(entry: dict, request_id: str, event_index: int) -> tuple[dict, dict | None]:
     message = entry["message"]
     start_fields = parse_request_fields(entry, "START")
@@ -800,6 +825,7 @@ def request_event(entry: dict, request_id: str, event_index: int) -> tuple[dict,
     if exception:
         event["exceptionId"] = exception["eventId"]
     return event, exception
+
 def request_marker_metadata(entry: dict, marker: str) -> dict:
     fields = parse_request_fields(entry, marker) or {}
     match = re.search(rf"\bREQ {marker}\s*\|(?P<fields>.*)", entry["message"])
@@ -815,6 +841,7 @@ def request_marker_metadata(entry: dict, marker: str) -> dict:
         "clientOs": parsed.get("clientos") or parsed.get("os"),
     })
     return fields
+
 def build_request_investigation(request_id: str, entries: list[dict], minutes: int,
                                 limit: int, window_start: datetime,
                                 window_end: datetime, loki_entry_count: int) -> dict:
@@ -864,6 +891,7 @@ def build_request_investigation(request_id: str, entries: list[dict], minutes: i
             "truncatedPossible": truncated,
         },
     }
+
 def request_entry_matches(entry: dict, request_id: str) -> bool:
     if entry["request_id"] == request_id:
         return True
@@ -873,18 +901,20 @@ def request_entry_matches(entry: dict, request_id: str) -> bool:
         entry["raw"],
     )
     return bool(malformed_header and malformed_header.group("request_id") == request_id)
+
 @app.get("/requests/{request_id}")
 async def request_timeline(
     request_id: str,
     minutes: Annotated[int, Query(ge=1, le=1440)] = 60,
     limit: Annotated[int, Query(ge=1, le=5000)] = 1000,
     access_token: Annotated[str | None, Header(alias="X-Request-Investigation-Token")] = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
 ):
     if not re.fullmatch(r"[A-Za-z0-9_-]{4,64}", request_id):
         raise HTTPException(status_code=400, detail="Invalid request ID")
     authorize_request_investigation(access_token)
     # Match MDC field rather than arbitrary message occurrences.
-    query = SELECTOR + f' |= "[{request_id},"'
+    query = selector_for_environment(environment) + f' |= "[{request_id},"'
     window_end = datetime.now(timezone.utc)
     window_start = window_end - timedelta(minutes=minutes)
     loki_entries = await loki_query(query, minutes, limit, window_end=window_end)
@@ -895,26 +925,29 @@ async def request_timeline(
     structured = build_request_investigation(
         request_id, entries, minutes, limit, window_start, window_end, len(loki_entries)
     )
-    return {"request_id": request_id, "environment": "uat", "count": len(entries),
+    return {"request_id": request_id, "environment": environment, "count": len(entries),
             "truncated_possible": len(loki_entries) >= limit,
             "start": starts[0] if starts else None,
             "end": ends[-1] if ends else None,
             "errors": [e for e in entries if e["level"] == "ERROR"],
             "timeline": entries, **structured}
+
 @app.get("/users/{user}/activity")
 async def user_activity(
     user: str,
     minutes: Annotated[int, Query(ge=1, le=1440)] = 15,
     limit: Annotated[int, Query(ge=1, le=5000)] = 100,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
 ):
     normalized_username = normalize_username(user)
     if not normalized_username:
         raise HTTPException(status_code=400, detail="Username must not be empty")
     mdc_pattern = (rf"(?i)\[[^,\]]+,\s*{re.escape(normalized_username)}"
                    rf"({re.escape(EMAIL_DOMAIN)})?\s*\]")
-    query = SELECTOR + " |~ " + json.dumps(mdc_pattern)
+    query = selector_for_environment(environment) + " |~ " + json.dumps(mdc_pattern)
     entries = await loki_query(query, minutes, limit)
-    return build_user_activity(entries, normalized_username, limit)
+    return build_user_activity(entries, normalized_username, limit, environment)
+
 @app.get("/errors/recent")
 async def recent_errors(
     minutes: Annotated[int, Query(ge=1, le=1440)] = 60,
@@ -923,15 +956,17 @@ async def recent_errors(
     exclude_auth: Annotated[bool, Query(alias="excludeAuth")] = False,
     user: str | None = None,
     exception: str | None = None,
+    environment: Annotated[Literal["uat", "prod"], Query(alias="env")] = "uat",
 ):
-    entries = await loki_query(SELECTOR + ' |= "ERROR"', minutes, limit)
+    selector = selector_for_environment(environment)
+    entries = await loki_query(selector + ' |= "ERROR"', minutes, limit)
     errors = [e for e in entries if e["level"] == "ERROR"]
     request_ids = list(dict.fromkeys(e["request_id"] for e in errors if e["request_id"]))
     related_entries = []
     if request_ids:
         request_pattern = r"\[(" + "|".join(re.escape(request_id) for request_id in request_ids) + r"),"
         related_entries = await loki_query(
-            SELECTOR + " |~ " + json.dumps(request_pattern), minutes, limit
+            selector + " |~ " + json.dumps(request_pattern), minutes, limit
         )
     enriched = enrich_recent_errors(errors, related_entries, minutes)
     normalized_filter_user = normalize_username(user) if user else None
@@ -948,6 +983,6 @@ async def recent_errors(
         enriched = [error for error in enriched if error["category"] != "authentication"]
     truncated_possible = len(entries) >= limit or len(related_entries) >= limit
     enriched.reverse()
-    return {"environment": "uat", "count": len(enriched),
+    return {"environment": environment, "count": len(enriched),
             "truncated_possible": truncated_possible,
             "count_is_exact": not truncated_possible, "errors": enriched}
