@@ -26,6 +26,8 @@ Try:
 curl -s http://127.0.0.1:8000/health | jq .
 curl -s 'http://127.0.0.1:8000/requests/39c1Yjae?minutes=1440' | jq '{request_id,count,start:(.start.message),end:(.end.message),errors:[.errors[].message]}'
 curl -s 'http://127.0.0.1:8000/errors/recent?minutes=60&limit=20' | jq '{count,errors:[.errors[]|{timestamp,request_id,exception,message:(.message|split("\n")[0])}]}'
+curl -s http://127.0.0.1:8000/analyze -H 'Content-Type: application/json' -d '{"requestId":"Qwk449Um","minutes":1440}' | jq .
+curl -s http://127.0.0.1:8000/analyze -H 'Content-Type: application/json' -d '{"text":"ERROR external API failed with status 502"}' | jq .
 ```
 
 Docs: http://127.0.0.1:8000/docs
@@ -38,3 +40,14 @@ large application-log event messages are previews, with full redacted evidence
 available in the detailed `timeline` field.
 
 Loki range-query limit applies; a large result can be truncated. The current implementation does not paginate.
+
+Set `API_TOKEN` to enable Groq analysis. The service sends only a compact,
+redacted diagnostic context to `openai/gpt-oss-20b`; it does not alter the
+existing request timeline or raw-log responses. Context defaults are capped at
+40 events, 900 characters per event, and 12,000 total characters. Successful
+request-ID analyses are cached by the fingerprint of that compact context;
+send `"forceRefresh": true` to bypass the cache.
+
+For `/analyze` request-ID investigations, the optional
+`X-Request-Investigation-Token` header follows the same protection as the
+request timeline endpoint. `minutes` defaults to 60 and is limited to 1-1440.
